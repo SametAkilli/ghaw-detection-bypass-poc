@@ -1,0 +1,66 @@
+name: PoC - gh-aw safe-job detection bypass
+
+# Minimal, self-contained reproduction of the job-gating flaw found in
+# Microsoft-owned compiled workflows (azure-sdk-for-python/pipeline-analysis-auto-fix.lock.yml
+# `create_branch` job, and azure-sdk-for-*/issue-triage.lock.yml `mention_owners` job).
+#
+# It uses the SAME `if:` conditions those jobs use, and forces the `detection`
+# job to FAIL (as strict-mode threat detection would on a detected prompt
+# injection). Expected result in the Actions run graph:
+#   * detection            -> failure   (a threat was "detected")
+#   * safe_outputs_pattern -> SKIPPED   (correctly blocked: gated on detection.result == 'success')
+#   * create_branch_pattern-> RUNS      (BYPASS: fires anyway; this is where `git push` lives)
+#   * mention_owners_pattern-> RUNS     (BYPASS: fires anyway)
+#
+# Run it: push to a throwaway repo and trigger via the Actions tab (workflow_dispatch).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    outputs:
+      output_types: ${{ steps.emit.outputs.output_types }}
+    steps:
+      - id: emit
+        # The "agent" decided (e.g. steered by prompt injection) to request these outputs.
+        run: echo "output_types=create_branch,mention_owners,add_comment" >> "$GITHUB_OUTPUT"
+
+  detection:
+    needs: agent
+    if: always() && needs.agent.result != 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Threat detection concludes a prompt-injection threat (strict mode fails the job)
+        run: |
+          echo "THREAT_DETECTION_RESULT: prompt injection detected"
+          exit 1   # strict mode -> setFailed() -> job result = failure
+
+  # ---- verbatim gating from the real compiled lock files ----
+
+  safe_outputs_pattern:            # azure-sdk .../issue-triage.lock.yml  (PROPERLY GATED)
+    needs: [agent, detection]
+    if: (!cancelled()) && needs.agent.result != 'skipped' && needs.detection.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "safe_outputs handler ran (should NOT happen when a threat was detected)"
+
+  create_branch_pattern:           # azure-sdk-for-python/pipeline-analysis-auto-fix.lock.yml
+    needs: [agent, detection]
+    if: (!cancelled()) && needs.agent.result != 'skipped' && contains(needs.agent.outputs.output_types, 'create_branch')
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "::warning::BYPASS - create_branch job executed despite detected threat."
+          echo "In the real workflow this job runs: git push origin HEAD:refs/heads/\$FIX_BRANCH"
+
+  mention_owners_pattern:          # azure-sdk-for-*/issue-triage.lock.yml
+    needs: [agent, detection]
+    if: (!cancelled()) && needs.agent.result != 'skipped' && contains(needs.agent.outputs.output_types, 'mention_owners')
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "::warning::BYPASS - mention_owners job executed despite detected threat."
